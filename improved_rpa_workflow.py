@@ -307,6 +307,10 @@ def filter_html_keep_interactive(html: str, preserve_scripts: bool = False, pres
         aria_attrs = [k for k in tag.attrs.keys() if isinstance(k, str) and k.startswith("aria-")]
         if aria_attrs:
             return True
+        # 关键词启发（常见交互组件类名/ID/名称）
+        class_id = " ".join(tag.get("class", [])) + " " + (tag.get("id") or "") + " " + (tag.get("name") or "")
+        if re.search(r"(btn|button|submit|search|filter|input|select|combo|dropdown|pager|pagination|next|prev|login|signin|signup|register|apply|确定|取消|提交|搜索|筛选|下一页|上一页)", class_id, re.I):
+            return True
         return False
 
     tags_to_keep = set()
@@ -351,11 +355,46 @@ def filter_html_keep_interactive(html: str, preserve_scripts: bool = False, pres
                         if anc.name in ("body", "html"):
                             break
 
-    for t in soup.find_all(True):
-        if t.name in ("html", "head", "body"):
-            continue
-        if t not in tags_to_keep:
-            t.decompose()
+    # 确保需要的脚本/样式节点不会在裁剪阶段被删除
+    if preserve_scripts:
+        for s in soup.find_all("script"):
+            tags_to_keep.add(s)
+            for anc in s.parents:
+                if isinstance(anc, Tag):
+                    tags_to_keep.add(anc)
+                    if anc.name in ("head", "body", "html"):
+                        break
+    if preserve_styles:
+        for st in soup.find_all("style"):
+            tags_to_keep.add(st)
+            for anc in st.parents:
+                if isinstance(anc, Tag):
+                    tags_to_keep.add(anc)
+                    if anc.name in ("head", "body", "html"):
+                        break
+        for l in soup.find_all("link"):
+            rels = l.get("rel") or []
+            rels_lower = [r.lower() for r in rels] if isinstance(rels, list) else [str(rels).lower()]
+            if "stylesheet" in rels_lower or l.get("as") == "style":
+                tags_to_keep.add(l)
+                for anc in l.parents:
+                    if isinstance(anc, Tag):
+                        tags_to_keep.add(anc)
+                        if anc.name in ("head", "body", "html"):
+                            break
+
+    if tags_to_keep:
+        # 仅当存在位于<body>下的保留节点时才进行裁剪，避免只保留<head>里的脚本/样式导致<body>为空
+        has_body_keep = any(
+            isinstance(k, Tag) and any(p.name == "body" for p in k.parents)
+            for k in tags_to_keep
+        )
+        if has_body_keep:
+            for t in soup.find_all(True):
+                if t.name in ("html", "head", "body"):
+                    continue
+                if t not in tags_to_keep:
+                    t.decompose()
 
     # 允许的属性集合，扩展以支持脚本/样式/样式链接的关键属性
     allowed_attrs = {
