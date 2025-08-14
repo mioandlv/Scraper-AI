@@ -241,16 +241,32 @@ def fetch_page_html(state: RPAState) -> RPAState:
 
 # === 新增：交互元素过滤 ===
 
-def filter_html_keep_interactive(html: str) -> str:
-    """仅保留与交互相关的DOM节点及必要上下文，清理无关标签与冗余属性。"""
+def detect_spa(html: str) -> bool:
+    """基于启发式判断页面是否为SPA，若是则需要保留script/css以辅助选择器推断。"""
+    lowered = html.lower()
+    spa_signals = [
+        'id="root"', 'id="app"', 'data-reactroot', 'ng-version', 'ng-app', 'v-cloak',
+        'next-data', 'vite', 'webpack', 'chunk.js', 'main.js', 'runtime.js', 'app.js',
+        'nuxt', 'umi.js', 'single-spa'
+    ]
+    return any(sig in lowered for sig in spa_signals)
+
+
+def filter_html_keep_interactive(html: str, preserve_scripts: bool = False, preserve_styles: bool = False) -> str:
+    """仅保留与交互相关的DOM节点及必要上下文，可选保留脚本和样式，清理无关标签与冗余属性。"""
     soup = BeautifulSoup(html, "html.parser")
 
     remove_tags = [
-        "script", "style", "svg", "img", "picture", "source", "video", "audio",
-        "canvas", "iframe", "object", "embed", "noscript", "meta", "link", "path"
+        # 根据参数决定是否移除脚本/样式/样式链接
+        *([] if preserve_scripts else ["script"]),
+        *([] if preserve_styles else ["style", "link"]),
+        # 始终移除的
+        "svg", "img", "picture", "source", "video", "audio",
+        "canvas", "iframe", "object", "embed", "noscript", "meta", "path"
     ]
-    for tag in soup.find_all(remove_tags):
-        tag.decompose()
+    if remove_tags:
+        for tag in soup.find_all(remove_tags):
+            tag.decompose()
 
     summary_comments_texts: List[str] = []
     for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
@@ -322,7 +338,7 @@ def filter_html_keep_interactive(html: str) -> str:
         if t.name in {"input", "select", "textarea"}:
             keep_label_for_control(t)
 
-    neighbor_text_tags = {"span", "small", "strong", "em", "b", "i", "u", "p", "label"}
+    neighbor_text_tags = {"span", "small", "strong", "em", "b", "i", "u", "p", "label", "h1", "h2", "h3", "h4", "h5", "h6"}
     for t in interactive_tags:
         for sib in [t.previous_sibling, t.next_sibling]:
             if sib is None:
@@ -341,10 +357,13 @@ def filter_html_keep_interactive(html: str) -> str:
         if t not in tags_to_keep:
             t.decompose()
 
+    # 允许的属性集合，扩展以支持脚本/样式/样式链接的关键属性
     allowed_attrs = {
         "id", "class", "name", "role", "href", "type", "placeholder", "value", "for",
         "title", "alt", "aria-label", "aria-labelledby", "aria-describedby",
-        "autocomplete", "tabindex"
+        "autocomplete", "tabindex", "style",
+        # script/link/style supportive attributes
+        "src", "rel", "media", "async", "defer", "crossorigin", "integrity", "nomodule"
     }
     allowed_event_attrs = {"onclick", "onchange", "oninput", "onkeydown", "onkeyup", "onsubmit"}
     allowed_data_attrs = {"data-test", "data-testid", "data-qa", "data-automation", "data-qaid", "data-cy", "data-id"}
@@ -360,8 +379,12 @@ def filter_html_keep_interactive(html: str) -> str:
                 continue
             del t.attrs[attr_name]
 
+    # 压缩文本节点
     for text_node in soup.find_all(string=True):
         if isinstance(text_node, Comment):
+            continue
+        # 跳过script/style内文本（后续单独处理）
+        if text_node.parent and text_node.parent.name in ("script", "style"):
             continue
         raw = str(text_node)
         stripped = raw.strip()
@@ -373,6 +396,21 @@ def filter_html_keep_interactive(html: str) -> str:
             normalized = normalized[:200] + "…"
         if normalized != raw:
             text_node.replace_with(NavigableString(normalized))
+
+    # 对保留的内联script/style进行内容截断，避免巨大体积
+    if preserve_scripts:
+        for s in soup.find_all("script"):
+            # 仅截断内联脚本内容
+            if not s.has_attr("src") and s.string:
+                content = str(s.string)
+                if len(content) > 8000:
+                    s.string.replace_with(content[:8000] + "/* …truncated… */")
+    if preserve_styles:
+        for st in soup.find_all("style"):
+            if st.string:
+                content = str(st.string)
+                if len(content) > 20000:
+                    st.string.replace_with(content[:20000] + "/* …truncated… */")
 
     if summary_comments_texts:
         body = soup.body or soup
@@ -386,7 +424,7 @@ def filter_html_keep_interactive(html: str) -> str:
 
 
 def filter_interactive_html(state: RPAState) -> RPAState:
-    """工作流节点：过滤HTML，仅保留交互相关元素，以缩小输入上下文。"""
+    """工作流节点：过滤HTML，仅保留交互相关元素；对SPA或指示需要CSS的页面保留脚本/样式。"""
     print("==== 过滤HTML只保留交互相关元素 ====")
     if state.get("error"):
         return state
@@ -394,8 +432,14 @@ def filter_interactive_html(state: RPAState) -> RPAState:
         html = state.get("page_html", "")
         if not html:
             return state
-        filtered = filter_html_keep_interactive(html)
-        print(f"过滤后HTML长度: {len(filtered)}，压缩率: {len(filtered) / max(len(html), 1):.2%}")
+        # 环境变量覆盖（若用户强制指定）
+        env_keep_scripts = os.environ.get("FILTER_KEEP_SCRIPTS", "").lower() in ("1", "true", "yes")
+        env_keep_styles = os.environ.get("FILTER_KEEP_STYLES", "").lower() in ("1", "true", "yes")
+        spa = detect_spa(html)
+        preserve_scripts = env_keep_scripts or spa
+        preserve_styles = env_keep_styles or spa
+        filtered = filter_html_keep_interactive(html, preserve_scripts=preserve_scripts, preserve_styles=preserve_styles)
+        print(f"过滤后HTML长度: {len(filtered)}，压缩率: {len(filtered) / max(len(html), 1):.2%} (SPA={spa}, keep_scripts={preserve_scripts}, keep_styles={preserve_styles})")
         return {**state, "filtered_html": filtered}
     except Exception as e:
         error_msg = f"HTML过滤失败: {str(e)}"
