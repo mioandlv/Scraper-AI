@@ -3,6 +3,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.prompts import ChatPromptTemplate
 from selenium import webdriver
 from bs4 import BeautifulSoup
+from bs4 import Comment
+from bs4.element import Tag, NavigableString
 from typing_extensions import TypedDict
 from typing import Annotated, Optional, Dict, Any, List
 import csv
@@ -56,6 +58,7 @@ class RPAState(TypedDict):
     job_keyword: Annotated[Optional[str], "update_string"]  # 解析出的职位关键词
     location: Annotated[Optional[str], "update_string"]  # 解析出的地点
     page_html: Annotated[Optional[str], "update_string"]  # 获取的页面HTML
+    filtered_html: Annotated[Optional[str], "update_string"]  # 过滤后的页面HTML
     workflow: dict  # 生成的RPA工作流程
     element_analysis: Annotated[Optional[Dict[str, Any]], "update_string"]  # 元素分析结果
     element_selectors: Annotated[Dict[str, Dict[str, Any]], "update_string"]  # 关键元素定位器
@@ -236,6 +239,170 @@ def fetch_page_html(state: RPAState) -> RPAState:
         print(error_msg)
         return {**state, "error": error_msg, "debug_info": traceback.format_exc()}
 
+# === 新增：交互元素过滤 ===
+
+def filter_html_keep_interactive(html: str) -> str:
+    """仅保留与交互相关的DOM节点及必要上下文，清理无关标签与冗余属性。"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    remove_tags = [
+        "script", "style", "svg", "img", "picture", "source", "video", "audio",
+        "canvas", "iframe", "object", "embed", "noscript", "meta", "link", "path"
+    ]
+    for tag in soup.find_all(remove_tags):
+        tag.decompose()
+
+    summary_comments_texts: List[str] = []
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        if "语义摘要" in str(comment):
+            summary_comments_texts.append(str(comment))
+        comment.extract()
+
+    interactive_roles = {
+        "button", "link", "textbox", "searchbox", "combobox", "checkbox", "radio",
+        "switch", "slider", "menuitem", "menu", "tab", "tabpanel", "tablist",
+        "listbox", "option", "spinbutton", "treeitem"
+    }
+
+    def is_interactive(tag) -> bool:
+        if not isinstance(tag, Tag):
+            return False
+        name = tag.name.lower()
+        if name in {"input", "button", "select", "textarea", "option", "optgroup", "datalist", "form", "label"}:
+            return True
+        if name == "a" and (tag.has_attr("href") or (tag.get("role") in interactive_roles)):
+            return True
+        role = tag.get("role")
+        if role and role.lower() in interactive_roles:
+            return True
+        tabindex = tag.get("tabindex")
+        if tabindex is not None and str(tabindex).strip() != "":
+            try:
+                return int(str(tabindex)) >= 0
+            except Exception:
+                return True
+        if tag.has_attr("contenteditable"):
+            value = str(tag.get("contenteditable")).lower()
+            if value != "false":
+                return True
+        for attr_name in tag.attrs.keys():
+            if isinstance(attr_name, str) and attr_name.startswith("on") and len(attr_name) > 2:
+                return True
+        aria_attrs = [k for k in tag.attrs.keys() if isinstance(k, str) and k.startswith("aria-")]
+        if aria_attrs:
+            return True
+        return False
+
+    tags_to_keep = set()
+    interactive_tags = []
+    for t in soup.find_all(True):
+        if is_interactive(t):
+            interactive_tags.append(t)
+            tags_to_keep.add(t)
+            for anc in t.parents:
+                if isinstance(anc, Tag):
+                    tags_to_keep.add(anc)
+                    if anc.name in ("body", "html"):
+                        break
+
+    def keep_label_for_control(control):
+        control_id = control.get("id")
+        if not control_id:
+            return
+        label = soup.find("label", attrs={"for": control_id})
+        if label:
+            tags_to_keep.add(label)
+            for anc in label.parents:
+                if isinstance(anc, Tag):
+                    tags_to_keep.add(anc)
+                    if anc.name in ("body", "html"):
+                        break
+
+    for t in interactive_tags:
+        if t.name in {"input", "select", "textarea"}:
+            keep_label_for_control(t)
+
+    neighbor_text_tags = {"span", "small", "strong", "em", "b", "i", "u", "p", "label"}
+    for t in interactive_tags:
+        for sib in [t.previous_sibling, t.next_sibling]:
+            if sib is None:
+                continue
+            if isinstance(sib, Tag) and sib.name in neighbor_text_tags:
+                tags_to_keep.add(sib)
+                for anc in sib.parents:
+                    if isinstance(anc, Tag):
+                        tags_to_keep.add(anc)
+                        if anc.name in ("body", "html"):
+                            break
+
+    for t in soup.find_all(True):
+        if t.name in ("html", "head", "body"):
+            continue
+        if t not in tags_to_keep:
+            t.decompose()
+
+    allowed_attrs = {
+        "id", "class", "name", "role", "href", "type", "placeholder", "value", "for",
+        "title", "alt", "aria-label", "aria-labelledby", "aria-describedby",
+        "autocomplete", "tabindex"
+    }
+    allowed_event_attrs = {"onclick", "onchange", "oninput", "onkeydown", "onkeyup", "onsubmit"}
+    allowed_data_attrs = {"data-test", "data-testid", "data-qa", "data-automation", "data-qaid", "data-cy", "data-id"}
+
+    for t in soup.find_all(True):
+        if not isinstance(t, Tag):
+            continue
+        attrs = dict(t.attrs)
+        for attr_name in list(attrs.keys()):
+            if attr_name in allowed_attrs or attr_name in allowed_event_attrs or attr_name in allowed_data_attrs:
+                continue
+            if attr_name.startswith("aria-"):
+                continue
+            del t.attrs[attr_name]
+
+    for text_node in soup.find_all(string=True):
+        if isinstance(text_node, Comment):
+            continue
+        raw = str(text_node)
+        stripped = raw.strip()
+        if not stripped:
+            text_node.replace_with("")
+            continue
+        normalized = re.sub(r"\s+", " ", stripped)
+        if len(normalized) > 200:
+            normalized = normalized[:200] + "…"
+        if normalized != raw:
+            text_node.replace_with(NavigableString(normalized))
+
+    if summary_comments_texts:
+        body = soup.body or soup
+        for text in reversed(summary_comments_texts):
+            body.insert(0, Comment(text))
+
+    html_out = str(soup)
+    html_out = re.sub(r">\s+<", "><", html_out)
+    html_out = re.sub(r"\s{2,}", " ", html_out)
+    return html_out
+
+
+def filter_interactive_html(state: RPAState) -> RPAState:
+    """工作流节点：过滤HTML，仅保留交互相关元素，以缩小输入上下文。"""
+    print("==== 过滤HTML只保留交互相关元素 ====")
+    if state.get("error"):
+        return state
+    try:
+        html = state.get("page_html", "")
+        if not html:
+            return state
+        filtered = filter_html_keep_interactive(html)
+        print(f"过滤后HTML长度: {len(filtered)}，压缩率: {len(filtered) / max(len(html), 1):.2%}")
+        return {**state, "filtered_html": filtered}
+    except Exception as e:
+        error_msg = f"HTML过滤失败: {str(e)}"
+        print(error_msg)
+        return {**state, "error": error_msg, "debug_info": traceback.format_exc()}
+
+
 def analyze_html_chunk(chunk: str, target_website: str, user_query: str) -> dict:
     """基于HTML分片进行元素分析"""
     try:
@@ -266,7 +433,7 @@ def analyze_page_elements(state: RPAState) -> RPAState:
         return state
 
     try:
-        html_content = state["page_html"]
+        html_content = state.get("filtered_html") or state["page_html"]
         window_size = 3000  # 字符窗口大小
         overlap_size = 500   # 重叠区域
         chunks = [html_content[i:i+window_size] 
@@ -588,6 +755,7 @@ def error_handler(state: RPAState) -> RPAState:
 builder = StateGraph(RPAState)
 builder.add_node("query_parser", parse_user_query)
 builder.add_node("page_fetcher", fetch_page_html)
+builder.add_node("html_filter", filter_interactive_html)
 builder.add_node("element_analyzer", analyze_page_elements)
 builder.add_node("script_generator", generate_rpa_script)
 builder.add_node("script_executor", execute_rpa_script)
@@ -597,7 +765,8 @@ builder.set_entry_point("query_parser")
 
 # 添加边
 builder.add_edge("query_parser", "page_fetcher")
-builder.add_edge("page_fetcher", "element_analyzer")
+builder.add_edge("page_fetcher", "html_filter")
+builder.add_edge("html_filter", "element_analyzer")
 builder.add_edge("element_analyzer", "script_generator")
 builder.add_edge("script_generator", "script_executor")
 
@@ -608,6 +777,10 @@ builder.add_conditional_edges(
 )
 builder.add_conditional_edges(
     "page_fetcher",
+    lambda state: "error_handler" if has_error(state) else "html_filter"
+)
+builder.add_conditional_edges(
+    "html_filter",
     lambda state: "error_handler" if has_error(state) else "element_analyzer"
 )
 builder.add_conditional_edges(
