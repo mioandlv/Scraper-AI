@@ -3,6 +3,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.prompts import ChatPromptTemplate
 from selenium import webdriver
 from bs4 import BeautifulSoup
+from bs4 import Comment
+from bs4.element import Tag, NavigableString
 from typing_extensions import TypedDict
 from typing import Annotated, Optional, Dict, Any, List
 import csv
@@ -56,6 +58,7 @@ class RPAState(TypedDict):
     job_keyword: Annotated[Optional[str], "update_string"]  # 解析出的职位关键词
     location: Annotated[Optional[str], "update_string"]  # 解析出的地点
     page_html: Annotated[Optional[str], "update_string"]  # 获取的页面HTML
+    filtered_html: Annotated[Optional[str], "update_string"]  # 过滤后的页面HTML
     workflow: dict  # 生成的RPA工作流程
     element_analysis: Annotated[Optional[Dict[str, Any]], "update_string"]  # 元素分析结果
     element_selectors: Annotated[Dict[str, Dict[str, Any]], "update_string"]  # 关键元素定位器
@@ -236,6 +239,238 @@ def fetch_page_html(state: RPAState) -> RPAState:
         print(error_msg)
         return {**state, "error": error_msg, "debug_info": traceback.format_exc()}
 
+# === 新增：交互元素过滤 ===
+
+
+
+def filter_html_keep_interactive(html: str, preserve_scripts: bool = False, preserve_styles: bool = False) -> str:
+    """仅保留与交互相关的DOM节点及必要上下文，可选保留脚本和样式，清理无关标签与冗余属性。"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    remove_tags = [
+        # 根据参数决定是否移除脚本/样式/样式链接
+        *([] if preserve_scripts else ["script"]),
+        *([] if preserve_styles else ["style", "link"]),
+        # 始终移除的
+        "svg", "img", "picture", "source", "video", "audio",
+        "canvas", "iframe", "object", "embed", "noscript", "meta", "path"
+    ]
+    if remove_tags:
+        for tag in soup.find_all(remove_tags):
+            tag.decompose()
+
+    summary_comments_texts: List[str] = []
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        if "语义摘要" in str(comment):
+            summary_comments_texts.append(str(comment))
+        comment.extract()
+
+    interactive_roles = {
+        "button", "link", "textbox", "searchbox", "combobox", "checkbox", "radio",
+        "switch", "slider", "menuitem", "menu", "tab", "tabpanel", "tablist",
+        "listbox", "option", "spinbutton", "treeitem"
+    }
+
+    def is_interactive(tag) -> bool:
+        if not isinstance(tag, Tag):
+            return False
+        name = tag.name.lower()
+        if name in {"input", "button", "select", "textarea", "option", "optgroup", "datalist", "form", "label"}:
+            return True
+        if name == "a" and (tag.has_attr("href") or (tag.get("role") in interactive_roles)):
+            return True
+        role = tag.get("role")
+        if role and role.lower() in interactive_roles:
+            return True
+        tabindex = tag.get("tabindex")
+        if tabindex is not None and str(tabindex).strip() != "":
+            try:
+                return int(str(tabindex)) >= 0
+            except Exception:
+                return True
+        if tag.has_attr("contenteditable"):
+            value = str(tag.get("contenteditable")).lower()
+            if value != "false":
+                return True
+        for attr_name in tag.attrs.keys():
+            if isinstance(attr_name, str) and attr_name.startswith("on") and len(attr_name) > 2:
+                return True
+        aria_attrs = [k for k in tag.attrs.keys() if isinstance(k, str) and k.startswith("aria-")]
+        if aria_attrs:
+            return True
+        # 关键词启发（常见交互组件类名/ID/名称）
+        class_id = " ".join(tag.get("class", [])) + " " + (tag.get("id") or "") + " " + (tag.get("name") or "")
+        if re.search(r"(btn|button|submit|search|filter|input|select|combo|dropdown|pager|pagination|next|prev|login|signin|signup|register|apply|确定|取消|提交|搜索|筛选|下一页|上一页)", class_id, re.I):
+            return True
+        return False
+
+    tags_to_keep = set()
+    interactive_tags = []
+    for t in soup.find_all(True):
+        if is_interactive(t):
+            interactive_tags.append(t)
+            tags_to_keep.add(t)
+            for anc in t.parents:
+                if isinstance(anc, Tag):
+                    tags_to_keep.add(anc)
+                    if anc.name in ("body", "html"):
+                        break
+
+    def keep_label_for_control(control):
+        control_id = control.get("id")
+        if not control_id:
+            return
+        label = soup.find("label", attrs={"for": control_id})
+        if label:
+            tags_to_keep.add(label)
+            for anc in label.parents:
+                if isinstance(anc, Tag):
+                    tags_to_keep.add(anc)
+                    if anc.name in ("body", "html"):
+                        break
+
+    for t in interactive_tags:
+        if t.name in {"input", "select", "textarea"}:
+            keep_label_for_control(t)
+
+    neighbor_text_tags = {"span", "small", "strong", "em", "b", "i", "u", "p", "label", "h1", "h2", "h3", "h4", "h5", "h6"}
+    for t in interactive_tags:
+        for sib in [t.previous_sibling, t.next_sibling]:
+            if sib is None:
+                continue
+            if isinstance(sib, Tag) and sib.name in neighbor_text_tags:
+                tags_to_keep.add(sib)
+                for anc in sib.parents:
+                    if isinstance(anc, Tag):
+                        tags_to_keep.add(anc)
+                        if anc.name in ("body", "html"):
+                            break
+
+    # 确保需要的脚本/样式节点不会在裁剪阶段被删除
+    if preserve_scripts:
+        for s in soup.find_all("script"):
+            tags_to_keep.add(s)
+            for anc in s.parents:
+                if isinstance(anc, Tag):
+                    tags_to_keep.add(anc)
+                    if anc.name in ("head", "body", "html"):
+                        break
+    if preserve_styles:
+        for st in soup.find_all("style"):
+            tags_to_keep.add(st)
+            for anc in st.parents:
+                if isinstance(anc, Tag):
+                    tags_to_keep.add(anc)
+                    if anc.name in ("head", "body", "html"):
+                        break
+        for l in soup.find_all("link"):
+            rels = l.get("rel") or []
+            rels_lower = [r.lower() for r in rels] if isinstance(rels, list) else [str(rels).lower()]
+            if "stylesheet" in rels_lower or l.get("as") == "style":
+                tags_to_keep.add(l)
+                for anc in l.parents:
+                    if isinstance(anc, Tag):
+                        tags_to_keep.add(anc)
+                        if anc.name in ("head", "body", "html"):
+                            break
+
+    if tags_to_keep:
+        # 仅当存在位于<body>下的保留节点时才进行裁剪，避免只保留<head>里的脚本/样式导致<body>为空
+        has_body_keep = any(
+            isinstance(k, Tag) and any(p.name == "body" for p in k.parents)
+            for k in tags_to_keep
+        )
+        if has_body_keep:
+            for t in soup.find_all(True):
+                if t.name in ("html", "head", "body"):
+                    continue
+                if t not in tags_to_keep:
+                    t.decompose()
+
+    # 允许的属性集合，扩展以支持脚本/样式/样式链接的关键属性
+    allowed_attrs = {
+        "id", "class", "name", "role", "href", "type", "placeholder", "value", "for",
+        "title", "alt", "aria-label", "aria-labelledby", "aria-describedby",
+        "autocomplete", "tabindex", "style",
+        # script/link/style supportive attributes
+        "src", "rel", "media", "async", "defer", "crossorigin", "integrity", "nomodule"
+    }
+    allowed_event_attrs = {"onclick", "onchange", "oninput", "onkeydown", "onkeyup", "onsubmit"}
+    allowed_data_attrs = {"data-test", "data-testid", "data-qa", "data-automation", "data-qaid", "data-cy", "data-id"}
+
+    for t in soup.find_all(True):
+        if not isinstance(t, Tag):
+            continue
+        attrs = dict(t.attrs)
+        for attr_name in list(attrs.keys()):
+            if attr_name in allowed_attrs or attr_name in allowed_event_attrs or attr_name in allowed_data_attrs:
+                continue
+            if attr_name.startswith("aria-"):
+                continue
+            del t.attrs[attr_name]
+
+    # 压缩文本节点
+    for text_node in soup.find_all(string=True):
+        if isinstance(text_node, Comment):
+            continue
+        # 跳过script/style内文本（后续单独处理）
+        if text_node.parent and text_node.parent.name in ("script", "style"):
+            continue
+        raw = str(text_node)
+        stripped = raw.strip()
+        if not stripped:
+            text_node.replace_with("")
+            continue
+        normalized = re.sub(r"\s+", " ", stripped)
+        if len(normalized) > 200:
+            normalized = normalized[:200] + "…"
+        if normalized != raw:
+            text_node.replace_with(NavigableString(normalized))
+
+    # 对保留的内联script/style进行内容截断，避免巨大体积
+    if preserve_scripts:
+        for s in soup.find_all("script"):
+            # 仅截断内联脚本内容
+            if not s.has_attr("src") and s.string:
+                content = str(s.string)
+                if len(content) > 8000:
+                    s.string.replace_with(content[:8000] + "/* …truncated… */")
+    if preserve_styles:
+        for st in soup.find_all("style"):
+            if st.string:
+                content = str(st.string)
+                if len(content) > 20000:
+                    st.string.replace_with(content[:20000] + "/* …truncated… */")
+
+    if summary_comments_texts:
+        body = soup.body or soup
+        for text in reversed(summary_comments_texts):
+            body.insert(0, Comment(text))
+
+    html_out = str(soup)
+    html_out = re.sub(r">\s+<", "><", html_out)
+    html_out = re.sub(r"\s{2,}", " ", html_out)
+    return html_out
+
+
+def filter_interactive_html(state: RPAState) -> RPAState:
+    """工作流节点：过滤HTML，仅保留交互相关元素；对SPA或指示需要CSS的页面保留脚本/样式。"""
+    print("==== 过滤HTML只保留交互相关元素 ====")
+    if state.get("error"):
+        return state
+    try:
+        html = state.get("page_html", "")
+        if not html:
+            return state
+        filtered = filter_html_keep_interactive(html, preserve_scripts=False, preserve_styles=False)
+        print(f"过滤后HTML长度: {len(filtered)}，压缩率: {len(filtered) / max(len(html), 1):.2%}")
+        return {**state, "filtered_html": filtered}
+    except Exception as e:
+        error_msg = f"HTML过滤失败: {str(e)}"
+        print(error_msg)
+        return {**state, "error": error_msg, "debug_info": traceback.format_exc()}
+
+
 def analyze_html_chunk(chunk: str, target_website: str, user_query: str) -> dict:
     """基于HTML分片进行元素分析"""
     try:
@@ -266,7 +501,7 @@ def analyze_page_elements(state: RPAState) -> RPAState:
         return state
 
     try:
-        html_content = state["page_html"]
+        html_content = state.get("filtered_html") or state["page_html"]
         window_size = 3000  # 字符窗口大小
         overlap_size = 500   # 重叠区域
         chunks = [html_content[i:i+window_size] 
@@ -588,6 +823,7 @@ def error_handler(state: RPAState) -> RPAState:
 builder = StateGraph(RPAState)
 builder.add_node("query_parser", parse_user_query)
 builder.add_node("page_fetcher", fetch_page_html)
+builder.add_node("html_filter", filter_interactive_html)
 builder.add_node("element_analyzer", analyze_page_elements)
 builder.add_node("script_generator", generate_rpa_script)
 builder.add_node("script_executor", execute_rpa_script)
@@ -597,7 +833,8 @@ builder.set_entry_point("query_parser")
 
 # 添加边
 builder.add_edge("query_parser", "page_fetcher")
-builder.add_edge("page_fetcher", "element_analyzer")
+builder.add_edge("page_fetcher", "html_filter")
+builder.add_edge("html_filter", "element_analyzer")
 builder.add_edge("element_analyzer", "script_generator")
 builder.add_edge("script_generator", "script_executor")
 
@@ -608,6 +845,10 @@ builder.add_conditional_edges(
 )
 builder.add_conditional_edges(
     "page_fetcher",
+    lambda state: "error_handler" if has_error(state) else "html_filter"
+)
+builder.add_conditional_edges(
+    "html_filter",
     lambda state: "error_handler" if has_error(state) else "element_analyzer"
 )
 builder.add_conditional_edges(
