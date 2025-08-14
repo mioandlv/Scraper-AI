@@ -241,15 +241,6 @@ def fetch_page_html(state: RPAState) -> RPAState:
 
 # === 新增：交互元素过滤 ===
 
-def detect_spa(html: str) -> bool:
-    """基于启发式判断页面是否为SPA，若是则需要保留script/css以辅助选择器推断。"""
-    lowered = html.lower()
-    spa_signals = [
-        'id="root"', 'id="app"', 'data-reactroot', 'ng-version', 'ng-app', 'v-cloak',
-        'next-data', 'vite', 'webpack', 'chunk.js', 'main.js', 'runtime.js', 'app.js',
-        'nuxt', 'umi.js', 'single-spa'
-    ]
-    return any(sig in lowered for sig in spa_signals)
 
 
 def filter_html_keep_interactive(html: str, preserve_scripts: bool = False, preserve_styles: bool = False) -> str:
@@ -471,14 +462,8 @@ def filter_interactive_html(state: RPAState) -> RPAState:
         html = state.get("page_html", "")
         if not html:
             return state
-        # 环境变量覆盖（若用户强制指定）
-        env_keep_scripts = os.environ.get("FILTER_KEEP_SCRIPTS", "").lower() in ("1", "true", "yes")
-        env_keep_styles = os.environ.get("FILTER_KEEP_STYLES", "").lower() in ("1", "true", "yes")
-        spa = detect_spa(html)
-        preserve_scripts = env_keep_scripts or spa
-        preserve_styles = env_keep_styles or spa
-        filtered = filter_html_keep_interactive(html, preserve_scripts=preserve_scripts, preserve_styles=preserve_styles)
-        print(f"过滤后HTML长度: {len(filtered)}，压缩率: {len(filtered) / max(len(html), 1):.2%} (SPA={spa}, keep_scripts={preserve_scripts}, keep_styles={preserve_styles})")
+        filtered = filter_html_keep_interactive(html, preserve_scripts=False, preserve_styles=False)
+        print(f"过滤后HTML长度: {len(filtered)}，压缩率: {len(filtered) / max(len(html), 1):.2%}")
         return {**state, "filtered_html": filtered}
     except Exception as e:
         error_msg = f"HTML过滤失败: {str(e)}"
